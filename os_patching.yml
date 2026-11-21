@@ -1,0 +1,201 @@
+---
+# OS patching & package management for RHEL-family hosts (dnf / yum)
+# Target: Ansible Automation Platform 2.7 (ee-supported-rhel9), ansible.builtin only.
+#
+# Every variable below can be overridden by a Job Template Survey / Extra Variables.
+
+- name: OS patching and package management (dnf/yum)
+  hosts: all
+  become: true
+  gather_facts: true
+  any_errors_fatal: false
+  max_fail_percentage: 0              # stop remaining batches if any host in a batch fails
+  serial: "{{ patch_batch_size }}"    # rolling batches, e.g. "1", "25%"
+
+  vars:
+    patch_batch_size: "25%"
+    # security | bugfix | latest | none   ("none" = only handle patch_packages)
+    patch_mode: security
+    # Optional: only install/update these packages instead of everything, e.g. ["httpd", "openssl"]
+    patch_packages: []
+    # Packages never to update. List, or comma separated string from a Survey: "kernel*,mongodb*"
+    exclude_packages: []
+    # if_needed | always | never
+    reboot_policy: if_needed
+    reboot_timeout_sec: 900
+    min_boot_space_mb: 100
+    min_var_space_mb: 1024
+    dnf_lock_timeout_sec: 120
+
+  pre_tasks:
+    - name: Validate input variables
+      ansible.builtin.assert:
+        that:
+          - patch_mode in ['security', 'bugfix', 'latest', 'none']
+          - reboot_policy in ['if_needed', 'always', 'never']
+        fail_msg: "patch_mode must be security|bugfix|latest|none and reboot_policy must be if_needed|always|never"
+        quiet: true
+
+    - name: Check the host is a RHEL-family system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'RedHat'
+          - ansible_facts['pkg_mgr'] in ['dnf', 'yum']
+        fail_msg: >-
+          Unsupported host: os_family={{ ansible_facts['os_family'] }},
+          pkg_mgr={{ ansible_facts['pkg_mgr'] }}
+        quiet: true
+
+    - name: Normalize variables
+      ansible.builtin.set_fact:
+        _exclude: >-
+          {{ (exclude_packages.split(',') if exclude_packages is string else exclude_packages)
+             | map('trim') | reject('equalto', '') | list }}
+        _packages: >-
+          {{ (patch_packages.split(',') if patch_packages is string else patch_packages)
+             | map('trim') | reject('equalto', '') | list }}
+        _use_dnf: "{{ ansible_facts['pkg_mgr'] == 'dnf' }}"
+
+    - name: Read free space on /boot and /var (MB)
+      ansible.builtin.command: "df -m --output=avail {{ item }}"
+      loop: ['/boot', '/var']
+      register: _df
+      changed_when: false
+      check_mode: false
+
+    - name: Verify minimum free disk space
+      ansible.builtin.assert:
+        that:
+          - (_df.results[0].stdout_lines[-1] | trim | int) >= (min_boot_space_mb | int)
+          - (_df.results[1].stdout_lines[-1] | trim | int) >= (min_var_space_mb | int)
+        fail_msg: >-
+          Not enough free space. /boot={{ _df.results[0].stdout_lines[-1] | trim }}MB (need {{ min_boot_space_mb }}),
+          /var={{ _df.results[1].stdout_lines[-1] | trim }}MB (need {{ min_var_space_mb }})
+        quiet: true
+
+    - name: Ensure yum-utils is installed (provides needs-restarting)
+      ansible.builtin.dnf:
+        name: yum-utils
+        state: present
+        lock_timeout: "{{ dnf_lock_timeout_sec }}"
+      when: _use_dnf | bool
+
+    - name: Ensure yum-utils is installed (yum hosts)
+      ansible.builtin.yum:
+        name: yum-utils
+        state: present
+      when: not (_use_dnf | bool)
+
+    - name: Record kernel before patching
+      ansible.builtin.set_fact:
+        _kernel_before: "{{ ansible_facts['kernel'] }}"
+
+  tasks:
+    # ---- Patch everything (security / bugfix / latest) with dnf ----
+    - name: "Patch all packages - dnf (mode: {{ patch_mode }})"
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        security: "{{ patch_mode == 'security' }}"
+        bugfix: "{{ patch_mode == 'bugfix' }}"
+        exclude: "{{ _exclude }}"
+        update_cache: true
+        lock_timeout: "{{ dnf_lock_timeout_sec }}"
+      register: _patch_dnf
+      when:
+        - _use_dnf | bool
+        - patch_mode != 'none'
+        - _packages | length == 0
+
+    # ---- Patch everything with yum (RHEL 7 style hosts) ----
+    - name: "Patch all packages - yum (mode: {{ patch_mode }})"
+      ansible.builtin.yum:
+        name: "*"
+        state: latest
+        security: "{{ patch_mode == 'security' }}"
+        bugfix: "{{ patch_mode == 'bugfix' }}"
+        exclude: "{{ _exclude }}"
+        update_cache: true
+      register: _patch_yum
+      when:
+        - not (_use_dnf | bool)
+        - patch_mode != 'none'
+        - _packages | length == 0
+
+    # ---- Install / update specific packages only ----
+    - name: Install or update specific packages - dnf
+      ansible.builtin.dnf:
+        name: "{{ _packages }}"
+        state: latest
+        update_cache: true
+        lock_timeout: "{{ dnf_lock_timeout_sec }}"
+      register: _pkg_dnf
+      when:
+        - _use_dnf | bool
+        - _packages | length > 0
+
+    - name: Install or update specific packages - yum
+      ansible.builtin.yum:
+        name: "{{ _packages }}"
+        state: latest
+        update_cache: true
+      register: _pkg_yum
+      when:
+        - not (_use_dnf | bool)
+        - _packages | length > 0
+
+    # ---- Reboot decision ----
+    # In Check mode yum-utils is only simulated, so needs-restarting may not exist yet.
+    - name: Locate needs-restarting
+      ansible.builtin.stat:
+        path: /usr/bin/needs-restarting
+      register: _nr_stat
+
+    - name: Fail if needs-restarting is missing on a real run
+      ansible.builtin.assert:
+        that: _nr_stat.stat.exists or ansible_check_mode
+        fail_msg: "needs-restarting not found. Install yum-utils (or dnf-utils) on the host."
+        quiet: true
+
+    - name: Check if a reboot is required (needs-restarting -r)
+      ansible.builtin.command: needs-restarting -r
+      register: _needs_restarting
+      failed_when: _needs_restarting.rc not in [0, 1]
+      changed_when: false
+      check_mode: false
+      when: _nr_stat.stat.exists
+
+    - name: Decide on reboot
+      ansible.builtin.set_fact:
+        _do_reboot: >-
+          {{ reboot_policy == 'always'
+             or (reboot_policy == 'if_needed' and (_needs_restarting.rc | default(0)) == 1) }}
+
+    - name: Reboot and wait for the host to return
+      ansible.builtin.reboot:
+        msg: "Reboot by AAP after OS patching"
+        reboot_timeout: "{{ reboot_timeout_sec | int }}"
+        pre_reboot_delay: 5
+        post_reboot_delay: 15
+        test_command: whoami
+      when: (_do_reboot | bool) and not ansible_check_mode
+
+    - name: Re-gather facts after reboot
+      ansible.builtin.setup:
+        gather_subset: min
+      when: (_do_reboot | bool) and not ansible_check_mode
+
+  post_tasks:
+    - name: Patch summary
+      ansible.builtin.debug:
+        msg:
+          - "Host            : {{ inventory_hostname }}"
+          - "OS              : {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+          - "Package manager : {{ ansible_facts['pkg_mgr'] }}"
+          - "Mode            : {{ patch_mode }}{{ ' (packages: ' ~ (_packages | join(', ')) ~ ')' if _packages | length > 0 else '' }}"
+          - "Packages changed: {{ ((_patch_dnf | default({})).changed | default(false))
+                                  or ((_patch_yum | default({})).changed | default(false))
+                                  or ((_pkg_dnf | default({})).changed | default(false))
+                                  or ((_pkg_yum | default({})).changed | default(false)) }}"
+          - "Reboot executed : {{ (_do_reboot | bool) and not ansible_check_mode }}"
+          - "Kernel          : {{ _kernel_before }} -> {{ ansible_facts['kernel'] }}"
