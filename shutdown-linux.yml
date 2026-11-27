@@ -34,14 +34,18 @@
       ansible.builtin.ping:
 
   tasks:
-    - name: Show the host and uptime that will be shut down
-      ansible.builtin.command: uptime
+    # Read /proc/uptime instead of calling `uptime`, which needs procps and is
+    # missing on minimal images and execution environments.
+    - name: Read the uptime of the host that will be shut down
+      ansible.builtin.slurp:
+        src: /proc/uptime
       register: pre_uptime
-      changed_when: false
 
     - name: Report target
       ansible.builtin.debug:
-        msg: "{{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}): {{ pre_uptime.stdout }}"
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}):
+          up {{ ((pre_uptime.content | b64decode).split()[0] | float / 86400) | round(2) }} days
 
     - name: Schedule power-off
       ansible.builtin.command: >-
