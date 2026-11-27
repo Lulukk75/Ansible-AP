@@ -1,0 +1,69 @@
+---
+# Graceful shutdown (power off) of Linux servers.
+# Run through AAP job template <entity>-shutdown-linux, behind the platform-change-gate workflow node.
+#
+# Extra vars (set from the job template survey):
+#   shutdown_delay_minutes  minutes to wait before power-off (default 1, 0 = immediately)
+#   shutdown_message        wall message shown to logged-in users
+#   confirm_shutdown        must be "SHUTDOWN" or the play stops before touching any host
+#   verify_down             wait until SSH stops answering (default true)
+- name: Shutdown Linux servers
+  hosts: all
+  gather_facts: false
+  become: true
+  serial: "{{ shutdown_serial | default('100%') }}"
+  vars:
+    shutdown_delay_minutes: 1
+    shutdown_message: "Planned shutdown requested through Ansible Automation Platform"
+    verify_down: true
+    verify_timeout_seconds: 300
+
+  pre_tasks:
+    - name: Require explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_shutdown is defined
+          - confirm_shutdown == 'SHUTDOWN'
+        fail_msg: "Set confirm_shutdown to SHUTDOWN to proceed. No host was touched."
+        quiet: true
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Check the host is reachable before shutting it down
+      ansible.builtin.ping:
+
+  tasks:
+    - name: Show the host and uptime that will be shut down
+      ansible.builtin.command: uptime
+      register: pre_uptime
+      changed_when: false
+
+    - name: Report target
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}): {{ pre_uptime.stdout }}"
+
+    - name: Schedule power-off
+      ansible.builtin.command: >-
+        shutdown -h {{ 'now' if (shutdown_delay_minutes | int) == 0 else '+' ~ (shutdown_delay_minutes | int) }}
+        "{{ shutdown_message }}"
+      async: 60
+      poll: 0
+      register: shutdown_job
+      changed_when: true
+
+    - name: Wait for SSH to stop answering
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: "{{ ansible_port | default(22) }}"
+        state: stopped
+        delay: "{{ (shutdown_delay_minutes | int) * 60 }}"
+        timeout: "{{ verify_timeout_seconds | int + (shutdown_delay_minutes | int) * 60 }}"
+      delegate_to: localhost
+      become: false
+      when: verify_down | bool
+
+    - name: Confirm shutdown
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} is powered off"
+      when: verify_down | bool
